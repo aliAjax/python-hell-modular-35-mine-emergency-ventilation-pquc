@@ -2,7 +2,7 @@ import hashlib
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .domain import BatchConflictError, ConflictError, NotFoundError, PermissionDenied, ValidationError
 from .rules import RuleEngine
 
 
@@ -89,6 +89,101 @@ class DomainService:
             self.audit.record(entity_id, actor, "merge_offline", None, entity["status"], {"source_id": source_id, "record_id": record_id})
             created.append(entity)
         return created
+
+    def _update_record_status(self, record, status):
+        """Update an offline record's status with one optimistic-lock retry."""
+        try:
+            return self.repository.update_entity(
+                record["id"], record["version"], status, record["data"]
+            )
+        except ConflictError:
+            current = self.repository.get_entity(record["id"])
+            return self.repository.update_entity(
+                record["id"], current["version"], status, current["data"]
+            )
+
+    def _mark_conflicts(self, records, conflicts):
+        conflict_ids = {c["entity_id"] for c in conflicts}
+        for record in records:
+            if record["id"] not in conflict_ids or record["status"] == "conflict":
+                continue
+            try:
+                self._update_record_status(record, "conflict")
+            except ConflictError:
+                pass
+
+    def _write_occupants(self, occupants, refuges):
+        """Persist recomputed occupants with optimistic locking.
+
+        If a refuge's version moved during the batch, recompute from the event
+        log and retry instead of overwriting the center's current state.
+        """
+        for refuge in refuges:
+            location_code = refuge["data"].get("location_code")
+            target = sorted(occupants.get(location_code, []))
+            for _ in range(3):
+                current = self.repository.get_entity(refuge["id"])
+                current_occupants = current["data"].get("occupants")
+                if current_occupants is not None and sorted(current_occupants) == target:
+                    break
+                merged = dict(current["data"])
+                merged["occupants"] = target
+                merged["occupancy"] = len(target)
+                try:
+                    self.repository.update_entity(
+                        refuge["id"], current["version"], current["status"], merged
+                    )
+                    break
+                except ConflictError:
+                    records = self.repository.list_offline_records()
+                    occupants, _ = self.rules.replay_offline_events(records)
+                    target = sorted(occupants.get(location_code, []))
+
+    def _mark_applied(self, records):
+        """Mark records applied; on a write failure leave the rest pending for retry."""
+        applied = []
+        pending = []
+        for idx, record in enumerate(records):
+            if record["status"] == "applied":
+                continue
+            try:
+                applied.append(self._update_record_status(record, "applied"))
+            except Exception:
+                pending.extend(records[idx:])
+                break
+        return applied, pending
+
+    def replay_offline(self, actor):
+        """Replay the offline event log as one batch in on-site time order.
+
+        The center state is recomputed from the full event log rather than
+        overwritten record-by-record. Contradictory entry/exit orders stop the
+        batch and are listed; capacity overruns reject the whole batch before
+        anything is written. Write failures leave unprocessed records pending so
+        the batch can be retried.
+        """
+        records = self.repository.list_offline_records()
+        occupants, conflicts = self.rules.replay_offline_events(records)
+        if conflicts:
+            self._mark_conflicts(records, conflicts)
+            raise BatchConflictError(
+                "offline replay found %d contradictory entry/exit record(s)" % len(conflicts),
+                conflicts=conflicts,
+            )
+        refuges = self.repository.list_entities(kind="refuge")
+        over = self.rules.check_capacity(occupants, refuges)
+        if over:
+            raise BatchConflictError(
+                "offline replay rejected: refuge occupancy exceeds capacity",
+                over_capacity=over,
+            )
+        self._write_occupants(occupants, refuges)
+        applied, pending = self._mark_applied(records)
+        return {
+            "replayed": len(applied),
+            "pending": len(pending),
+            "occupants": occupants,
+        }
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

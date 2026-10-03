@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+from .domain import BatchConflictError, ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
 def _require(data, fields):
@@ -82,6 +82,131 @@ def _validate_offline(data):
         raise ValidationError("recorded_at must be ISO-8601")
 
 
+def _parse_movement(record):
+    """Return (event, worker_id, location_code) for an entry/exit record, else None.
+
+    The movement fields live under the record's ``payload``. Legacy records
+    without an ``event`` field (e.g. gas readings) are ignored for occupancy.
+    A record that declares an event but is missing the worker or location is
+    malformed and reported as a conflict.
+    """
+    data = record.get("data", {})
+    payload = data.get("payload", {})
+    if not isinstance(payload, dict):
+        return None
+    event = payload.get("event")
+    if event not in ("entry", "exit"):
+        return None
+    worker_id = payload.get("worker_id")
+    location_code = payload.get("location_code")
+    if not worker_id or not location_code:
+        return False
+    return event, str(worker_id), str(location_code)
+
+
+def replay_offline_events(records):
+    """Replay the offline event log in on-site (recorded_at) order.
+
+    This is an event-sourced recomputation: the current occupancy is derived by
+    replaying every entry/exit record in chronological order, not by copying the
+    last known state. Returns ``(occupants, conflicts)`` where ``occupants`` maps
+    a refuge location_code to the list of worker ids currently inside it, and
+    ``conflicts`` lists records whose entry/exit order is self-contradictory.
+    """
+    ordered = sorted(records, key=lambda r: (r["data"].get("recorded_at", ""), r["id"]))
+    worker_location = {}
+    occupants = {}
+    conflicts = []
+    for record in ordered:
+        parsed = _parse_movement(record)
+        if parsed is None:
+            continue
+        data = record.get("data", {})
+        if parsed is False:
+            conflicts.append({
+                "entity_id": record["id"],
+                "source_id": data.get("source_id"),
+                "record_id": data.get("record_id"),
+                "recorded_at": data.get("recorded_at"),
+                "reason": "entry/exit record is missing worker_id or location_code",
+            })
+            continue
+        event, worker_id, location_code = parsed
+        current = worker_location.get(worker_id)
+        if event == "entry":
+            if current is not None:
+                conflicts.append({
+                    "entity_id": record["id"],
+                    "source_id": data.get("source_id"),
+                    "record_id": data.get("record_id"),
+                    "worker_id": worker_id,
+                    "location_code": location_code,
+                    "recorded_at": data.get("recorded_at"),
+                    "reason": "worker already inside %s, cannot enter %s" % (current, location_code),
+                })
+                continue
+            worker_location[worker_id] = location_code
+            occupants.setdefault(location_code, []).append(worker_id)
+        else:
+            if current is None:
+                conflicts.append({
+                    "entity_id": record["id"],
+                    "source_id": data.get("source_id"),
+                    "record_id": data.get("record_id"),
+                    "worker_id": worker_id,
+                    "location_code": location_code,
+                    "recorded_at": data.get("recorded_at"),
+                    "reason": "worker is not inside any refuge, cannot exit %s" % location_code,
+                })
+                continue
+            if current != location_code:
+                conflicts.append({
+                    "entity_id": record["id"],
+                    "source_id": data.get("source_id"),
+                    "record_id": data.get("record_id"),
+                    "worker_id": worker_id,
+                    "location_code": location_code,
+                    "recorded_at": data.get("recorded_at"),
+                    "reason": "worker is inside %s, cannot exit from %s" % (current, location_code),
+                })
+                continue
+            worker_location[worker_id] = None
+            occupants[location_code].remove(worker_id)
+    return occupants, conflicts
+
+
+def check_capacity(occupants, refuges):
+    """Return a list of refuges whose recomputed occupancy exceeds capacity."""
+    over = []
+    for refuge in refuges:
+        data = refuge.get("data", {})
+        location_code = data.get("location_code")
+        capacity = data.get("capacity", 0)
+        occupancy = len(occupants.get(location_code, []))
+        if occupancy > capacity:
+            over.append({
+                "location_code": location_code,
+                "capacity": capacity,
+                "occupancy": occupancy,
+            })
+    return over
+
+
+def _alarm_gas_in_area(lookup, area_code):
+    return any(
+        s["data"].get("location_code") == area_code and s["status"] == "alarm"
+        for s in _all(lookup, "sensor")
+    )
+
+
+def _people_in_area(lookup, area_code):
+    return [
+        w for w in _all(lookup, "worker")
+        if w["data"].get("location_code") == area_code
+        and w["status"] in ("active", "missing", "located")
+    ]
+
+
 def _sensor_alarm(actor, entity, data, lookup):
     if float(entity["data"].get("gas_ppm", 0)) < float(entity["data"].get("threshold_ppm", 1)):
         raise ValidationError("alarm requires a reading at or above threshold")
@@ -94,6 +219,19 @@ def _complete_task(actor, entity, data, lookup):
     return {"completed_by": actor.user_id}
 
 
+def _restore_ventilation(actor, entity, data, lookup):
+    area = entity["data"].get("area_code")
+    if _alarm_gas_in_area(lookup, area):
+        raise ConflictError(
+            "cannot restore ventilation: alarm gas remains in area %s" % area
+        )
+    if _people_in_area(lookup, area):
+        raise ConflictError(
+            "cannot restore ventilation: unevacuated workers remain in area %s" % area
+        )
+    return {"restored_by": actor.user_id}
+
+
 def _close_incident(actor, entity, data, lookup):
     if [w for w in _all(lookup, "worker") if w["status"] in ("missing", "located")]:
         raise ConflictError("cannot close incident while workers are missing or located")
@@ -102,6 +240,13 @@ def _close_incident(actor, entity, data, lookup):
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
+    records = _all(lookup, "offline_record")
+    occupants, _ = replay_offline_events(records)
+    if [r for r in records if r["status"] == "conflict"]:
+        raise ConflictError("cannot close incident: unverified offline conflicts remain")
+    over = check_capacity(occupants, _all(lookup, "refuge"))
+    if over:
+        raise ConflictError("cannot close incident: refuge occupancy exceeds capacity")
     return {"closed_by": actor.user_id}
 
 
@@ -114,7 +259,7 @@ class RuleEngine:
     INITIAL_STATUS = {
         "worker": "active", "sensor": "normal", "ventilation": "running",
         "passage": "open", "refuge": "available", "incident": "detected",
-        "task": "proposed", "offline_record": "merged",
+        "task": "proposed", "offline_record": "pending",
     }
     TRANSITIONS = {
         "worker": {
@@ -161,6 +306,9 @@ class RuleEngine:
             "accept": (("assigned",), "in_progress"),
             "complete": (("in_progress",), "completed"),
             "cancel": (("proposed", "assigned", "in_progress"), "cancelled"),
+        },
+        "offline_record": {
+            "resolve": (("conflict",), "applied"),
         },
     }
     CREATE_REQUIRED = {
@@ -223,6 +371,7 @@ class RuleEngine:
         "accept": ("admin", "field", "dispatcher"),
         "complete": ("admin", "field", "dispatcher"),
         "cancel": ("admin", "dispatcher", "safety"),
+        ("offline_record", "resolve"): ("admin", "safety"),
     }
     CUSTOM_CREATE = {
         "worker": lambda a, d, l: _validate_worker(d),
@@ -236,12 +385,20 @@ class RuleEngine:
     }
     CUSTOM_TRANSITIONS = {
         ("sensor", "raise_alarm"): _sensor_alarm,
+        ("ventilation", "restore"): _restore_ventilation,
         ("incident", "close"): _close_incident,
         ("task", "complete"): _complete_task,
+        ("offline_record", "resolve"): lambda a, e, d, l: {"resolved_by": a.user_id},
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def replay_offline_events(self, records):
+        return replay_offline_events(records)
+
+    def check_capacity(self, occupants, refuges):
+        return check_capacity(occupants, refuges)
 
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)

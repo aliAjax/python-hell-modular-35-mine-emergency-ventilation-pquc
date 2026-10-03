@@ -33,17 +33,22 @@ curl http://127.0.0.1:8335/health
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/offline-records`：合并现场离线记录（幂等）。
+- `POST /api/offline-records/replay`：按现场时间批量重放进出记录并重算硐室占用。
 - `GET /api/audit`：读取审计记录。
 
 身份通过`X-User-Id`和`X-Role`请求头传入，角色和动作权限由规则引擎校验。## 核心流程
 
 创建矿井事件、人员和设备记录后，依次执行撤离、搜救、通风恢复和事件关闭。`POST /api/offline-records` 用于合并现场离线记录，`source_id + record_id` 相同会幂等返回原记录。
 
+现场断网期间登记的进出记录，通过 `POST /api/offline-records/replay` 按现场时间（`recorded_at`）重放成一批入账，而不是按记录号逐条塞入。重放以完整事件日志为准重算硐室占用：同一人的进出顺序自相矛盾（未进先出、重复进入等）会整批停下并列出冲突记录（状态置为 `conflict`）；重算后占用超过硐室容量会拒绝整批并回滚，不写入任何占用。写入失败时未处理的记录保留 `pending` 状态，可直接重试。管理员可用 `resolve` 动作核对标记为 `conflict` 的记录。
+
 ## 规则重点
 
 - 活跃任务按 `dedupe_key` 防止重复派工。
 - 气体读数按阈值计算`severity`。
-- 事件关闭前必须没有失联或已定位人员、没有活跃任务，并且所有通风设备恢复运行。
+- 通风设备复转前，必须确认所在区域没有报警气体、没有未撤出的人员。
+- 事件关闭前必须没有失联或已定位人员、没有活跃任务，所有通风设备恢复运行，硐室占用不超过容量，且没有未核对的进出冲突。
 
 ## 测试
 

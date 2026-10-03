@@ -23,6 +23,19 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class BatchConflictError(ConflictError):
+    """An offline replay batch was rejected atomically.
+
+    ``conflicts`` holds contradictory entry/exit records (未核对冲突), and
+    ``over_capacity`` holds refuges whose recomputed occupancy exceeds capacity.
+    """
+
+    def __init__(self, message, conflicts=None, over_capacity=None):
+        super().__init__(message)
+        self.conflicts = conflicts or []
+        self.over_capacity = over_capacity or []
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

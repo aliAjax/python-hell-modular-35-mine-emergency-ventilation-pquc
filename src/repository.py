@@ -103,6 +103,11 @@ class SQLiteRepository:
             ).fetchall()
         return [self._entity_from_row(row) for row in rows]
 
+    def list_offline_records(self):
+        """Return offline records sorted by on-site time (recorded_at), then id."""
+        records = self.list_entities(kind="offline_record")
+        return sorted(records, key=lambda r: (r["data"].get("recorded_at", ""), r["id"]))
+
     def find_entities(self, kind, field, value):
         entities = self.list_entities(kind=kind)
         if field == "*":

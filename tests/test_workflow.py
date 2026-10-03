@@ -40,6 +40,9 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(sensor["data"]["severity"], "alarm")
         sensor = self.act(sensor, "raise_alarm")
         self.assertEqual(sensor["status"], "alarm")
+        # Gas must clear before the fan can be restored (复转前确认无报警气体).
+        sensor = self.act(sensor, "clear", {})
+        self.assertEqual(sensor["status"], "normal")
 
         vent = self.create("ventilation", {"name": "fan-1", "area_code": "M-01", "capacity": 100})
         vent = self.act(vent, "stop", {})
