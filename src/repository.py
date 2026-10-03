@@ -80,6 +80,163 @@ class SQLiteRepository:
             )
         return self.get_entity(entity_id)
 
+    def stage_entities(self, items):
+        """Insert raw records that do not exist yet; existing rows are left untouched.
+
+        Returns the rows now present in the database (both freshly staged and
+        previously persisted), keyed by id, so unprocessed records survive a
+        failed replay and can be retried with the same batch.
+        """
+        if not items:
+            return {}
+        now = utcnow()
+        ids = [item["id"] for item in items]
+        placeholders = ",".join("?" for _ in ids)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executemany(
+                "INSERT OR IGNORE INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                [
+                    (
+                        item["id"],
+                        item["kind"],
+                        item["status"],
+                        json.dumps(item["data"], ensure_ascii=False, sort_keys=True),
+                        item["actor_id"],
+                        now,
+                        now,
+                    )
+                    for item in items
+                ],
+            )
+            rows = connection.execute(
+                "SELECT * FROM entities WHERE id IN (%s)" % placeholders, ids
+            ).fetchall()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {row["id"]: self._entity_from_row(row) for row in rows}
+
+    def apply_replay(self, plan, actor_id):
+        """Commit a replay plan atomically.
+
+        plan = {
+            "actions": [
+                {"type": "entity_action", "entity_id": str, "status": str, "data": dict},
+                {"type": "refuge_status", "entity_id": str, "status": str, "data": dict},
+            ],
+            "records": [
+                {"id": offline_entity_id, "status": "applied",
+                 "conflicts": list, "data": dict, "audited": bool},
+            ],
+            "audits": [
+                {"entity_id", "action", "from_status", "to_status", "detail"}
+            ],
+        }
+
+        Any failure rolls the whole batch back, leaving staged pending records
+        in place so the caller can retry.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in plan["actions"]:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (item["entity_id"],)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + item["entity_id"])
+                expected_version = item.get("expected_version")
+                if expected_version is not None and int(row["version"]) != int(expected_version):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected_version, row["version"])
+                    )
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (
+                        item["status"],
+                        json.dumps(item["data"], ensure_ascii=False, sort_keys=True),
+                        now,
+                        item["entity_id"],
+                    ),
+                )
+            for record in plan["records"]:
+                payload = json.dumps(record["data"], ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, data = ?, updated_at = ? WHERE id = ?",
+                    (record["status"], payload, now, record["id"]),
+                )
+            for entry in plan["audits"]:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["entity_id"],
+                        actor_id,
+                        entry.get("actor_role", "system"),
+                        entry["action"],
+                        entry.get("from_status"),
+                        entry["to_status"],
+                        json.dumps(entry.get("detail", {}), ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_replay_conflicts(self, items, actor_id):
+        """Persist the conflict list on records that contradict each other.
+
+        items = [{"id", "conflicts": [...], "data": dict}]
+        """
+        if not items:
+            return
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in items:
+                connection.execute(
+                    "UPDATE entities SET status = 'conflict', data = ?, updated_at = ? WHERE id = ?",
+                    (
+                        json.dumps(item["data"], ensure_ascii=False, sort_keys=True),
+                        now,
+                        item["id"],
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item["id"],
+                        actor_id,
+                        "system",
+                        "replay_conflict",
+                        "pending",
+                        "conflict",
+                        json.dumps({"conflicts": item["conflicts"]}, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_entity(self, entity_id):
         with self._connect() as connection:
             row = connection.execute(

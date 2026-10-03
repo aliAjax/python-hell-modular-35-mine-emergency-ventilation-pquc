@@ -27,6 +27,14 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class ReplayConflictError(DomainError):
+    """Offline replay cannot continue because records contradict each other."""
+
+    def __init__(self, message, conflicts=None):
+        super().__init__(message)
+        self.conflicts = conflicts or []
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

@@ -10,6 +10,7 @@ from .domain import (
     InvalidTransition,
     NotFoundError,
     PermissionDenied,
+    ReplayConflictError,
     ValidationError,
 )
 
@@ -62,6 +63,13 @@ def create_handler(service, rules, static_dir):
                 status = 403
             elif isinstance(exc, NotFoundError):
                 status = 404
+            elif isinstance(exc, ReplayConflictError):
+                status = 409
+                self._send(
+                    status,
+                    {"error": str(exc), "type": type(exc).__name__, "conflicts": exc.conflicts},
+                )
+                return
             elif isinstance(exc, (ConflictError, InvalidTransition)):
                 status = 409
             elif isinstance(exc, ValidationError):
@@ -84,6 +92,8 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "refuge-occupancy"]:
+                    return self._send(200, {"items": service.refuge_occupancy()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -103,7 +113,7 @@ def create_handler(service, rules, static_dir):
                 actor = self._actor()
                 if parts == ["api", "offline-records"]:
                     body = self._body()
-                    return self._send(200, {"items": service.merge_offline(actor, body.get("records", []))})
+                    return self._send(200, service.merge_offline(actor, body.get("records", [])))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

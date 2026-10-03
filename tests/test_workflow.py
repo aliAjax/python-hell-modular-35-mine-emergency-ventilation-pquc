@@ -43,6 +43,9 @@ class WorkflowTest(unittest.TestCase):
 
         vent = self.create("ventilation", {"name": "fan-1", "area_code": "M-01", "capacity": 100})
         vent = self.act(vent, "stop", {})
+        # The area must be clear of alarm gas and left-behind workers before
+        # the fan is allowed to restart.
+        sensor = self.act(sensor, "clear", {})
         vent = self.act(vent, "restore", {"tested_at": "2026-09-27T11:00:00Z"})
         self.assertEqual(vent["status"], "running")
 
@@ -59,8 +62,9 @@ class WorkflowTest(unittest.TestCase):
         record = {"source_id": "field-a", "record_id": "42", "recorded_at": "2026-09-27T10:00:00Z", "payload": {"type": "gas", "value": 12}}
         first = self.service.merge_offline(self.actor, [record])
         second = self.service.merge_offline(self.actor, [record])
-        self.assertEqual(first[0]["id"], second[0]["id"])
+        self.assertEqual(first["applied"][0]["id"], second["skipped"][0])
         self.assertEqual(len(self.service.list("offline_record")), 1)
+        self.assertEqual(self.service.list("offline_record")[0]["status"], "applied")
 
 
 if __name__ == "__main__":
